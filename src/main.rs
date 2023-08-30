@@ -103,14 +103,14 @@ async fn send_requsts(
     cfg: &Cfg,
     socket: Arc<Socket>,
     mut senders: Vec<Sender<Sender<Time>>>,
-) -> Vec<JoinHandle<()>> {
+) -> Result<Vec<JoinHandle<()>>, AppError> {
     let mut request_buf = [0; MutableEchoRequestPacket::minimum_packet_size()];
     let mut handles = Vec::with_capacity(cfg.ping_count as usize);
     senders.reverse(); // Get ready to element `pop`ping
 
     let mut interval = tokio::time::interval(Duration::from_millis(cfg.ping_interval_ms));
     for i in 0..cfg.ping_count {
-        send_echo_request(&socket, &mut request_buf, i);
+        send_echo_request(&socket, &mut request_buf, i)?;
         let sent_at = Instant::now();
         let (tx, rx) = oneshot::channel::<Time>();
         senders.pop().unwrap().send(tx).unwrap();
@@ -129,7 +129,7 @@ async fn send_requsts(
         }));
         interval.tick().await;
     }
-    handles
+    Ok(handles)
 }
 
 #[tokio::main]
@@ -149,22 +149,27 @@ async fn main() -> Result<(), AppError> {
         loop {
             let len = read_socket(&socket_for_listener, &mut buf).await;
             let received_at = Instant::now();
-            let seq = validate_icmp_response_packet(&buf, len).unwrap();
             // Inform the dedicated task about the received response.
-            match receivers[seq as usize].try_recv() {
-                Ok(tx) => {
-                    if let Err(_) = tx.send(received_at) {
-                        eprintln!("Receiver dropped ({})", seq);
-                    }
+            // Silently drop incorrect ones.
+            if let Some(seq) = validate_icmp_response_packet(&buf, len) {
+                match receivers.get_mut(seq as usize) {
+                    Some(rx) => match rx.try_recv() {
+                        Ok(tx) => {
+                            if let Err(_) = tx.send(received_at) {
+                                eprintln!("Receiver dropped ({})", seq);
+                            }
+                        }
+                        // It doesn't seem usefull to separate the cases of
+                        // too early and duplicated responses.
+                        Err(_) => Message::UnexpectedEcho(seq).publish(),
+                    },
+                    None => eprintln!("Unexpected seq {}", seq),
                 }
-                // It doesn't seem usefull to separate the cases of
-                // too early and duplicated responses.
-                Err(_) => Message::UnexpectedEcho(seq).publish(),
-            };
+            }
         }
     });
 
-    let handles = send_requsts(&cfg, socket_for_sender, senders).await;
+    let handles = send_requsts(&cfg, socket_for_sender, senders).await?;
     for handle in handles {
         handle.await.expect("Task paniced");
     }
@@ -193,7 +198,9 @@ mod test {
             Some(socket2::Protocol::ICMPV4),
         )
         .unwrap();
-        let handles = send_requsts(cfg, Arc::new(fake_socket), senders).await;
+        let handles = send_requsts(cfg, Arc::new(fake_socket), senders)
+            .await
+            .unwrap();
         for handle in handles {
             handle.await.expect("Task paniced");
         }

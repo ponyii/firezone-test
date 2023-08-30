@@ -5,8 +5,8 @@ use std::{
 
 use pnet::packet::{
     icmp::{
-        echo_reply::EchoReplyPacket, echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket,
-        IcmpTypes,
+        checksum, echo_reply::EchoReplyPacket, echo_request::MutableEchoRequestPacket, IcmpCode,
+        IcmpPacket, IcmpTypes,
     },
     ipv4::Ipv4Packet,
     Packet,
@@ -23,6 +23,7 @@ pub const RESPONSE_BYTES: usize =
 #[derive(Debug)]
 pub enum AppError {
     InvalidArgs(String),
+    SocketError(std::io::Error),
 }
 
 impl From<ParseIntError> for AppError {
@@ -37,6 +38,12 @@ impl From<AddrParseError> for AppError {
     }
 }
 
+impl From<std::io::Error> for AppError {
+    fn from(err: std::io::Error) -> Self {
+        Self::SocketError(err)
+    }
+}
+
 pub fn to_sock_addr(a: &String) -> Result<SockAddr, AppError> {
     Ok(SocketAddrV4::new(a.parse()?, 0).into())
 }
@@ -46,10 +53,9 @@ pub fn socket(cfg: &Cfg) -> Result<Socket, AppError> {
         socket2::Domain::IPV4,
         socket2::Type::RAW,
         Some(socket2::Protocol::ICMPV4),
-    )
-    .unwrap();
-    socket.connect(&to_sock_addr(&cfg.address)?).unwrap();
-    socket.set_nonblocking(true).unwrap();
+    )?;
+    socket.connect(&to_sock_addr(&cfg.address)?)?;
+    socket.set_nonblocking(true)?;
     Ok(socket)
 }
 
@@ -58,9 +64,10 @@ pub fn send_echo_request(
     socket: &Arc<Socket>,
     buf: &mut [u8; MutableEchoRequestPacket::minimum_packet_size()],
     seq: u16,
-) {
+) -> Result<(), AppError> {
     let p = create_icmp_request_packet(buf, seq, IDENTIFIER);
-    socket.send(p.packet()).unwrap();
+    socket.send(p.packet())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -68,7 +75,8 @@ pub fn send_echo_request(
     _: &Arc<Socket>,
     _: &mut [u8; MutableEchoRequestPacket::minimum_packet_size()],
     _: u16,
-) {
+) -> Result<(), AppError> {
+    Ok(())
 }
 
 pub fn create_icmp_request_packet(
@@ -83,21 +91,29 @@ pub fn create_icmp_request_packet(
     packet.set_sequence_number(seq);
     packet.set_identifier(identifier);
 
-    let checksum = pnet::packet::icmp::checksum(&IcmpPacket::new(packet.packet()).unwrap());
+    let checksum = checksum(&IcmpPacket::new(packet.packet()).unwrap());
     packet.set_checksum(checksum);
 
     packet
 }
 
 // Validates the response and returns its sequence number.
+// For the sake of simplicity only ICMP header is checked,
+// any unexpected packets are silently ignored.
 pub fn validate_icmp_response_packet(buf: &[MaybeUninit<u8>], len: usize) -> Option<u16> {
-    // TODO: proper validation & error handling
     if len != RESPONSE_BYTES {
         return None;
     }
     let safe_buf: [u8; RESPONSE_BYTES] = std::array::from_fn(|i| unsafe { buf[i].assume_init() });
     let packet = Ipv4Packet::new(&safe_buf[0..len])?;
     let echo_reply = EchoReplyPacket::new(packet.payload())?;
+    if echo_reply.get_icmp_type() != IcmpTypes::EchoReply
+        || echo_reply.get_icmp_code() != IcmpCode(0)
+        || echo_reply.get_identifier() != IDENTIFIER
+        || echo_reply.get_checksum() != checksum(&IcmpPacket::new(echo_reply.packet())?)
+    {
+        return None;
+    }
     Some(echo_reply.get_sequence_number())
 }
 
