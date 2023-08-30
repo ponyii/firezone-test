@@ -10,10 +10,13 @@ use pnet::packet::{
     Packet,
 };
 use socket2::{SockAddr, Socket};
+use tokio::sync::oneshot;
 
 const ADDRESS: &str = "8.8.8.8";
 // Identifier randomization would be necessary to use multiple ICMP servers at once.
 const IDENTIFIER: u16 = 100;
+const PING_COUNT: u16 = 10;
+const PING_INTERVAL_MS: u64 = 1;
 const ECHO_TIMEOUT_SEC: u64 = 5;
 const RESPONSE_BYTES: usize =
     EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size();
@@ -32,25 +35,52 @@ async fn main() {
     .unwrap();
     socket.connect(&to_sock_addr(ADDRESS)).unwrap();
     socket.set_nonblocking(true).unwrap();
+    let socket_for_listener = Arc::new(socket);
+    let socket_for_sender = socket_for_listener.clone();
 
     let mut request_buf = [0; MutableEchoRequestPacket::minimum_packet_size()];
-    let mut response_buf: [u8; RESPONSE_BYTES] = [0; RESPONSE_BYTES];
-    let buf_ref =
-        unsafe { &mut *(response_buf.as_mut_slice() as *mut [u8] as *mut [MaybeUninit<u8>]) };
 
-    let p = create_icmp_request_packet(&mut request_buf, 0, IDENTIFIER);
-    socket.send(p.packet()).unwrap();
-    tokio::time::timeout(Duration::from_secs(ECHO_TIMEOUT_SEC), async {
+    let mut receivers = Vec::with_capacity(PING_COUNT as usize);
+    let mut senders = Vec::with_capacity(PING_COUNT as usize);
+    for _ in 0..PING_COUNT {
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<()>>();
+        receivers.push(rx);
+        senders.push(tx);
+    }
+    senders.reverse();
+
+    let mut handles = Vec::with_capacity(PING_COUNT as usize);
+
+    tokio::spawn(async move {
+        let mut buf: [MaybeUninit<u8>; RESPONSE_BYTES] = [MaybeUninit::uninit(); RESPONSE_BYTES];
         loop {
-            let len = read_socket(&socket, buf_ref).await;
-            if validate_icmp_response_packet(&response_buf, len).unwrap() == 0 {
-                println!("response received");
-                break;
-            }
+            let len = read_socket(&socket_for_listener, &mut buf).await;
+            let seq = validate_icmp_response_packet(&buf, len).unwrap();
+            match receivers[seq as usize].try_recv() {
+                Ok(tx) => tx.send(()).unwrap(),
+                Err(_) => (), // TODO: handle errors
+            };
         }
-    })
-    .await
-    .unwrap();
+    });
+
+    let mut interval = tokio::time::interval(Duration::from_millis(PING_INTERVAL_MS));
+    for i in 0..PING_COUNT {
+        let p = create_icmp_request_packet(&mut request_buf, i, IDENTIFIER);
+        socket_for_sender.send(p.packet()).unwrap();
+
+        let (tx, rx) = oneshot::channel::<()>();
+        senders.pop().unwrap().send(tx).unwrap();
+        handles.push(tokio::spawn(async move {
+            let value = tokio::time::timeout(Duration::from_secs(ECHO_TIMEOUT_SEC), rx).await;
+            eprintln!("value: {:?}", value); // TODO: handle the value
+        }));
+
+        interval.tick().await;
+    }
+
+    for handle in handles {
+        handle.await.expect("Task paniced");
+    }
 }
 
 fn create_icmp_request_packet(
@@ -72,14 +102,18 @@ fn create_icmp_request_packet(
 }
 
 // Validates the response and returns its sequence number.
-fn validate_icmp_response_packet(buf: &[u8], len: usize) -> Option<u16> {
+fn validate_icmp_response_packet(buf: &[MaybeUninit<u8>], len: usize) -> Option<u16> {
     // TODO: proper validation & error handling
-    let packet = Ipv4Packet::new(&buf[0..len])?;
+    if len != RESPONSE_BYTES {
+        return None;
+    }
+    let safe_buf: [u8; RESPONSE_BYTES] = std::array::from_fn(|i| unsafe { buf[i].assume_init() });
+    let packet = Ipv4Packet::new(&safe_buf[0..len])?;
     let echo_reply = EchoReplyPacket::new(packet.payload())?;
     Some(echo_reply.get_sequence_number())
 }
 
-async fn read_socket(socket: &Socket, buf: &mut [MaybeUninit<u8>]) -> usize {
+async fn read_socket(socket: &Arc<Socket>, buf: &mut [MaybeUninit<u8>]) -> usize {
     loop {
         match socket.recv(buf) {
             Err(e) => {
