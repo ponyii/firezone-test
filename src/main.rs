@@ -1,5 +1,5 @@
 use std::net::SocketAddrV4;
-use std::{io::ErrorKind, mem::MaybeUninit, sync::Arc, time::Duration};
+use std::{io::ErrorKind, mem::MaybeUninit, sync::Arc, time::Duration, time::Instant};
 
 use pnet::packet::{
     icmp::{
@@ -11,6 +11,8 @@ use pnet::packet::{
 };
 use socket2::{SockAddr, Socket};
 use tokio::sync::oneshot;
+
+type Time = std::time::Instant;
 
 const ADDRESS: &str = "8.8.8.8";
 // Identifier randomization would be necessary to use multiple ICMP servers at once.
@@ -43,7 +45,7 @@ async fn main() {
     let mut receivers = Vec::with_capacity(PING_COUNT as usize);
     let mut senders = Vec::with_capacity(PING_COUNT as usize);
     for _ in 0..PING_COUNT {
-        let (tx, rx) = oneshot::channel::<oneshot::Sender<()>>();
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<Time>>();
         receivers.push(rx);
         senders.push(tx);
     }
@@ -55,9 +57,10 @@ async fn main() {
         let mut buf: [MaybeUninit<u8>; RESPONSE_BYTES] = [MaybeUninit::uninit(); RESPONSE_BYTES];
         loop {
             let len = read_socket(&socket_for_listener, &mut buf).await;
+            let received_at = Instant::now();
             let seq = validate_icmp_response_packet(&buf, len).unwrap();
             match receivers[seq as usize].try_recv() {
-                Ok(tx) => tx.send(()).unwrap(),
+                Ok(tx) => tx.send(received_at).unwrap(),
                 Err(_) => (), // TODO: handle errors
             };
         }
@@ -68,11 +71,18 @@ async fn main() {
         let p = create_icmp_request_packet(&mut request_buf, i, IDENTIFIER);
         socket_for_sender.send(p.packet()).unwrap();
 
-        let (tx, rx) = oneshot::channel::<()>();
+        let sent_at = Instant::now();
+        let (tx, rx) = oneshot::channel::<Time>();
         senders.pop().unwrap().send(tx).unwrap();
         handles.push(tokio::spawn(async move {
-            let value = tokio::time::timeout(Duration::from_secs(ECHO_TIMEOUT_SEC), rx).await;
-            eprintln!("value: {:?}", value); // TODO: handle the value
+            let res = tokio::time::timeout(Duration::from_secs(ECHO_TIMEOUT_SEC), rx).await;
+            match res {
+                Ok(Ok(received_at)) => {
+                    println!("{},{},{}", ADDRESS, i, (received_at - sent_at).as_micros())
+                }
+                Ok(Err(e)) => eprintln!("Receiver dropped ({}): {}", i, e),
+                Err(_) => println!("Timeout ({})", i),
+            }
         }));
 
         interval.tick().await;
