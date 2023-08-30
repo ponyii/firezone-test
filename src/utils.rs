@@ -79,6 +79,7 @@ pub fn send_echo_request(
     Ok(())
 }
 
+// From the template.
 pub fn create_icmp_request_packet(
     buf: &mut [u8; MutableEchoRequestPacket::minimum_packet_size()],
     seq: u16,
@@ -117,6 +118,7 @@ pub fn validate_icmp_response_packet(buf: &[MaybeUninit<u8>], len: usize) -> Opt
     Some(echo_reply.get_sequence_number())
 }
 
+// From the template but slightly modified.
 pub async fn read_socket(socket: &Arc<Socket>, buf: &mut [MaybeUninit<u8>]) -> usize {
     loop {
         match socket.recv(buf) {

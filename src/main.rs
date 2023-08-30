@@ -15,9 +15,11 @@ pub mod utils;
 
 type Time = std::time::Instant;
 
+// All the output messages for users (i.e. not developers) are registered here.
 enum Message {
     Ok(String, u16, Duration),
     Timeout(u16),
+    // Probably this one should be turned into developers-only error message.
     UnexpectedEcho(u16),
 }
 
@@ -39,7 +41,8 @@ pub struct Cfg {
     // Current implementation does not allow setting interval _significantly_ less
     // than 1 ms as this interval must be much longer than tokio task spawning time.
     ping_interval_ms: u64,
-    echo_timeout_sec: u64, // const
+    // This value is hardcoded now.
+    echo_timeout_sec: u64,
 }
 
 impl Cfg {
@@ -98,7 +101,7 @@ fn create_oneshots(num: usize) -> (Vec<Sender<Sender<Time>>>, Vec<Receiver<Sende
     (senders, receivers)
 }
 
-// Send requests and spawn response awaiting tasks for each
+// Send requests and spawn response-awaiting tasks for each
 async fn send_requsts(
     cfg: &Cfg,
     socket: Arc<Socket>,
@@ -106,7 +109,7 @@ async fn send_requsts(
 ) -> Result<Vec<JoinHandle<()>>, AppError> {
     let mut request_buf = [0; MutableEchoRequestPacket::minimum_packet_size()];
     let mut handles = Vec::with_capacity(cfg.ping_count as usize);
-    senders.reverse(); // Get ready to element `pop`ping
+    senders.reverse(); // Get ready to index-reversing `pop`ping
 
     let mut interval = tokio::time::interval(Duration::from_millis(cfg.ping_interval_ms));
     for i in 0..cfg.ping_count {
@@ -171,7 +174,7 @@ async fn main() -> Result<(), AppError> {
 
     let handles = send_requsts(&cfg, socket_for_sender, senders).await?;
     for handle in handles {
-        handle.await.expect("Task paniced");
+        handle.await.expect("Task panicked");
     }
     Ok(())
 }
@@ -202,7 +205,7 @@ mod test {
             .await
             .unwrap();
         for handle in handles {
-            handle.await.expect("Task paniced");
+            handle.await.expect("Task panicked");
         }
     }
 
@@ -243,6 +246,8 @@ mod test {
         let cfg = test_config();
         let (senders, receivers) = create_oneshots(cfg.ping_count as usize);
         let cfg_copy = cfg.clone();
+        // This thread sends `Instant::now()` to the `i`th tasks
+        // roughly when `i + 1`th is being spawned.
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(cfg_copy.ping_interval_ms));
