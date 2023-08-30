@@ -1,4 +1,7 @@
-use std::{io::ErrorKind, mem::MaybeUninit, net::SocketAddrV4, sync::Arc, time::Duration};
+use std::{
+    io::ErrorKind, mem::MaybeUninit, net::AddrParseError, net::SocketAddrV4, num::ParseIntError,
+    sync::Arc, time::Duration,
+};
 
 use pnet::packet::{
     icmp::{
@@ -10,25 +13,44 @@ use pnet::packet::{
 };
 use socket2::{SockAddr, Socket};
 
+use crate::Cfg;
+
 // Identifier randomization would be necessary to use multiple ICMP servers at once.
 const IDENTIFIER: u16 = 100;
 pub const RESPONSE_BYTES: usize =
     EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size();
 
-fn to_sock_addr(a: &str) -> SockAddr {
-    SocketAddrV4::new(a.parse().unwrap(), 0).into()
+#[derive(Debug)]
+pub enum AppError {
+    InvalidArgs(String),
 }
 
-pub fn socket(address: &str) -> Socket {
+impl From<ParseIntError> for AppError {
+    fn from(err: ParseIntError) -> Self {
+        Self::InvalidArgs(err.to_string())
+    }
+}
+
+impl From<AddrParseError> for AppError {
+    fn from(err: AddrParseError) -> Self {
+        Self::InvalidArgs(err.to_string())
+    }
+}
+
+pub fn to_sock_addr(a: &String) -> Result<SockAddr, AppError> {
+    Ok(SocketAddrV4::new(a.parse()?, 0).into())
+}
+
+pub fn socket(cfg: &Cfg) -> Result<Socket, AppError> {
     let socket = Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::RAW,
         Some(socket2::Protocol::ICMPV4),
     )
     .unwrap();
-    socket.connect(&to_sock_addr(address)).unwrap();
+    socket.connect(&to_sock_addr(&cfg.address)?).unwrap();
     socket.set_nonblocking(true).unwrap();
-    socket
+    Ok(socket)
 }
 
 #[cfg(not(test))]

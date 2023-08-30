@@ -1,4 +1,4 @@
-use std::{mem::MaybeUninit, sync::Arc, time::Duration, time::Instant};
+use std::{env, mem::MaybeUninit, ops::Range, sync::Arc, time::Duration, time::Instant};
 
 use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
 use socket2::Socket;
@@ -8,24 +8,15 @@ use tokio::{
 };
 
 use utils::{
-    read_socket, send_echo_request, socket, validate_icmp_response_packet, RESPONSE_BYTES,
+    read_socket, send_echo_request, socket, validate_icmp_response_packet, AppError, RESPONSE_BYTES,
 };
 
 pub mod utils;
 
 type Time = std::time::Instant;
 
-// TODO: get from command line
-const ADDRESS: &str = "8.8.8.8";
-const PING_COUNT: u16 = 10;
-// Current implementation does not allow setting interval _significantly_ less
-// than 1 ms as this interval must be much longer than tokio task spawning time.
-const PING_INTERVAL_MS: u64 = 1;
-
-const ECHO_TIMEOUT_SEC: u64 = 5;
-
 enum Message {
-    Ok(u16, Duration),
+    Ok(String, u16, Duration),
     Timeout(u16),
     UnexpectedEcho(u16),
 }
@@ -34,10 +25,65 @@ enum Message {
 impl Message {
     fn publish(self) {
         match self {
-            Self::Ok(seq, dur) => println!("{},{},{}", ADDRESS, seq, dur.as_micros()),
+            Self::Ok(address, seq, dur) => println!("{},{},{}", address, seq, dur.as_micros()),
             Self::Timeout(seq) => println!("Timeout ({})", seq),
             Self::UnexpectedEcho(seq) => println!("Unexpected echo reply ({})", seq),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Cfg {
+    address: String,
+    ping_count: u16,
+    // Current implementation does not allow setting interval _significantly_ less
+    // than 1 ms as this interval must be much longer than tokio task spawning time.
+    ping_interval_ms: u64,
+    echo_timeout_sec: u64, // const
+}
+
+impl Cfg {
+    const PING_COUNT_RANGE: Range<u16> = 1..11;
+    const PING_INTERVAL_MS_RANGE: Range<u64> = 1..1001;
+
+    fn parse_args() -> Result<Self, AppError> {
+        let args: Vec<String> = env::args().collect();
+        if args.len() != 2 {
+            return Err(AppError::InvalidArgs(format!(
+                "Expected one arg, found {}",
+                args.len() - 1
+            )));
+        }
+        let split_args: Vec<&str> = args[1].split(',').collect();
+        if split_args.len() != 3 {
+            return Err(AppError::InvalidArgs(format!(
+                "Can't parse the argument, 3 comma-separated pieces expected, found {}",
+                split_args.len()
+            )));
+        }
+        Ok(Self {
+            address: split_args[0].to_owned(),
+            ping_count: split_args[1].parse()?,
+            ping_interval_ms: split_args[2].parse()?,
+            echo_timeout_sec: 5,
+        })
+    }
+
+    fn init() -> Result<Self, AppError> {
+        let cfg = Self::parse_args()?;
+        if !Self::PING_COUNT_RANGE.contains(&cfg.ping_count) {
+            return Err(AppError::InvalidArgs(format!(
+                "Ping count must lie in {:?}",
+                Self::PING_COUNT_RANGE
+            )));
+        }
+        if !Self::PING_INTERVAL_MS_RANGE.contains(&cfg.ping_interval_ms) {
+            return Err(AppError::InvalidArgs(format!(
+                "Ping interval (ms) must lie in {:?}",
+                Self::PING_INTERVAL_MS_RANGE
+            )));
+        }
+        Ok(cfg)
     }
 }
 
@@ -54,26 +100,28 @@ fn create_oneshots(num: usize) -> (Vec<Sender<Sender<Time>>>, Vec<Receiver<Sende
 
 // Send requests and spawn response awaiting tasks for each
 async fn send_requsts(
-    num: u16,
+    cfg: &Cfg,
     socket: Arc<Socket>,
     mut senders: Vec<Sender<Sender<Time>>>,
 ) -> Vec<JoinHandle<()>> {
     let mut request_buf = [0; MutableEchoRequestPacket::minimum_packet_size()];
-    let mut handles = Vec::with_capacity(num as usize);
+    let mut handles = Vec::with_capacity(cfg.ping_count as usize);
     senders.reverse(); // Get ready to element `pop`ping
 
-    let mut interval = tokio::time::interval(Duration::from_millis(PING_INTERVAL_MS));
-    for i in 0..num {
+    let mut interval = tokio::time::interval(Duration::from_millis(cfg.ping_interval_ms));
+    for i in 0..cfg.ping_count {
         send_echo_request(&socket, &mut request_buf, i);
         let sent_at = Instant::now();
         let (tx, rx) = oneshot::channel::<Time>();
         senders.pop().unwrap().send(tx).unwrap();
+        let cfg_copy = cfg.clone();
         handles.push(tokio::spawn(async move {
-            let res = tokio::time::timeout(Duration::from_secs(ECHO_TIMEOUT_SEC), rx).await;
+            let res =
+                tokio::time::timeout(Duration::from_secs(cfg_copy.echo_timeout_sec), rx).await;
             match res {
                 Ok(Ok(received_at)) => {
                     let dur = received_at - sent_at;
-                    Message::Ok(i, dur).publish();
+                    Message::Ok(cfg_copy.address, i, dur).publish();
                 }
                 Ok(Err(e)) => eprintln!("Sender dropped ({}): {}", i, e),
                 Err(_) => Message::Timeout(i).publish(),
@@ -85,13 +133,15 @@ async fn send_requsts(
 }
 
 #[tokio::main]
-async fn main() {
-    let socket = socket(ADDRESS);
+async fn main() -> Result<(), AppError> {
+    let cfg = Cfg::init()?;
+
+    let socket = socket(&cfg)?;
     let socket_for_listener = Arc::new(socket);
     let socket_for_sender = socket_for_listener.clone();
 
     // `senders[i]` and `receiver[i]` pertain to the `i`th sent request.
-    let (senders, mut receivers) = create_oneshots(PING_COUNT as usize);
+    let (senders, mut receivers) = create_oneshots(cfg.ping_count as usize);
 
     // Spawn a listener
     tokio::spawn(async move {
@@ -114,10 +164,11 @@ async fn main() {
         }
     });
 
-    let handles = send_requsts(PING_COUNT, socket_for_sender, senders).await;
+    let handles = send_requsts(&cfg, socket_for_sender, senders).await;
     for handle in handles {
         handle.await.expect("Task paniced");
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -127,7 +178,6 @@ mod test {
     use std::mem::discriminant;
 
     static mut OUT: Vec<Message> = vec![];
-
     // Our test design makes concurrent `publish`ing impossible,
     // so I don't really feel like using locks here
     impl Message {
@@ -136,30 +186,34 @@ mod test {
         }
     }
 
-    async fn run_tasks(senders: Vec<Sender<Sender<Time>>>) {
+    async fn run_tasks(cfg: &Cfg, senders: Vec<Sender<Sender<Time>>>) {
         let fake_socket = Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::DGRAM, // avoid permission checks on Linux
             Some(socket2::Protocol::ICMPV4),
         )
         .unwrap();
-        let handles = send_requsts(PING_COUNT, Arc::new(fake_socket), senders).await;
+        let handles = send_requsts(cfg, Arc::new(fake_socket), senders).await;
         for handle in handles {
             handle.await.expect("Task paniced");
         }
     }
 
-    // TODO: test-only parameters
-
     #[tokio::test]
     async fn test_no_reply() {
-        let (senders, receivers) = create_oneshots(PING_COUNT as usize);
-        run_tasks(senders).await;
+        let cfg = Cfg {
+            address: "".to_owned(),
+            ping_count: 50,
+            ping_interval_ms: 1,
+            echo_timeout_sec: 1,
+        };
+        let (senders, receivers) = create_oneshots(cfg.ping_count as usize);
+        run_tasks(&cfg, senders).await;
         let expected_msg = discriminant(&Message::Timeout(0));
         unsafe {
             assert_eq!(
                 OUT.len(),
-                PING_COUNT as usize,
+                cfg.ping_count as usize,
                 "There're irresponsive tasks"
             );
             for m in &OUT {
