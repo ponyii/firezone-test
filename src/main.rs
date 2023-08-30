@@ -1,16 +1,13 @@
-use std::net::SocketAddrV4;
-use std::{io::ErrorKind, mem::MaybeUninit, sync::Arc, time::Duration, time::Instant};
+use std::{mem::MaybeUninit, sync::Arc, time::Duration, time::Instant};
 
-use pnet::packet::{
-    icmp::{
-        echo_reply::EchoReplyPacket, echo_request::MutableEchoRequestPacket, IcmpCode, IcmpPacket,
-        IcmpTypes,
-    },
-    ipv4::Ipv4Packet,
-    Packet,
-};
-use socket2::{SockAddr, Socket};
+use pnet::packet::{Packet, icmp::echo_request::MutableEchoRequestPacket};
 use tokio::sync::oneshot;
+
+use utils::{
+    create_icmp_request_packet, read_socket, socket, validate_icmp_response_packet, RESPONSE_BYTES,
+};
+
+pub mod utils;
 
 type Time = std::time::Instant;
 
@@ -24,23 +21,10 @@ const PING_INTERVAL_MS: u64 = 1;
 // Identifier randomization would be necessary to use multiple ICMP servers at once.
 const IDENTIFIER: u16 = 100;
 const ECHO_TIMEOUT_SEC: u64 = 5;
-const RESPONSE_BYTES: usize =
-    EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size();
-
-fn to_sock_addr(a: &str) -> SockAddr {
-    SocketAddrV4::new(a.parse().unwrap(), 0).into()
-}
 
 #[tokio::main]
 async fn main() {
-    let socket = Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::RAW,
-        Some(socket2::Protocol::ICMPV4),
-    )
-    .unwrap();
-    socket.connect(&to_sock_addr(ADDRESS)).unwrap();
-    socket.set_nonblocking(true).unwrap();
+    let socket = socket(ADDRESS);
     let socket_for_listener = Arc::new(socket);
     let socket_for_sender = socket_for_listener.clone();
 
@@ -103,50 +87,5 @@ async fn main() {
 
     for handle in handles {
         handle.await.expect("Task paniced");
-    }
-}
-
-fn create_icmp_request_packet(
-    buf: &mut [u8; MutableEchoRequestPacket::minimum_packet_size()],
-    seq: u16,
-    identifier: u16,
-) -> MutableEchoRequestPacket {
-    let mut packet = MutableEchoRequestPacket::new(buf).unwrap();
-
-    packet.set_icmp_type(IcmpTypes::EchoRequest);
-    packet.set_icmp_code(IcmpCode(0));
-    packet.set_sequence_number(seq);
-    packet.set_identifier(identifier);
-
-    let checksum = pnet::packet::icmp::checksum(&IcmpPacket::new(packet.packet()).unwrap());
-    packet.set_checksum(checksum);
-
-    packet
-}
-
-// Validates the response and returns its sequence number.
-fn validate_icmp_response_packet(buf: &[MaybeUninit<u8>], len: usize) -> Option<u16> {
-    // TODO: proper validation & error handling
-    if len != RESPONSE_BYTES {
-        return None;
-    }
-    let safe_buf: [u8; RESPONSE_BYTES] = std::array::from_fn(|i| unsafe { buf[i].assume_init() });
-    let packet = Ipv4Packet::new(&safe_buf[0..len])?;
-    let echo_reply = EchoReplyPacket::new(packet.payload())?;
-    Some(echo_reply.get_sequence_number())
-}
-
-async fn read_socket(socket: &Arc<Socket>, buf: &mut [MaybeUninit<u8>]) -> usize {
-    loop {
-        match socket.recv(buf) {
-            Err(e) => {
-                if e.kind() == ErrorKind::WouldBlock {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                } else {
-                    panic!("Something went wrong while reading the socket");
-                }
-            }
-            Ok(res) => return res,
-        }
     }
 }
