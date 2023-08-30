@@ -146,7 +146,9 @@ async fn main() -> Result<(), AppError> {
     // `senders[i]` and `receiver[i]` pertain to the `i`th sent request.
     let (senders, mut receivers) = create_oneshots(cfg.ping_count as usize);
 
-    // Spawn a listener
+    // Spawn a listener.
+    // It's not obligatory to validate responses and log errors right in the listener,
+    // but for the sake of simplicity these operations are performed here.
     tokio::spawn(async move {
         let mut buf: [MaybeUninit<u8>; RESPONSE_BYTES] = [MaybeUninit::uninit(); RESPONSE_BYTES];
         loop {
