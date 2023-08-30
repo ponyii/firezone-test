@@ -14,11 +14,15 @@ use tokio::sync::oneshot;
 
 type Time = std::time::Instant;
 
+// TODO: get from command line
 const ADDRESS: &str = "8.8.8.8";
+const PING_COUNT: u16 = 10;
+// Current implementation does not allow setting interval _significantly_ less
+// than 1 ms as this interval must be much longer than tokio task spawning time.
+const PING_INTERVAL_MS: u64 = 1;
+
 // Identifier randomization would be necessary to use multiple ICMP servers at once.
 const IDENTIFIER: u16 = 100;
-const PING_COUNT: u16 = 10;
-const PING_INTERVAL_MS: u64 = 1;
 const ECHO_TIMEOUT_SEC: u64 = 5;
 const RESPONSE_BYTES: usize =
     EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size();
@@ -42,6 +46,7 @@ async fn main() {
 
     let mut request_buf = [0; MutableEchoRequestPacket::minimum_packet_size()];
 
+    // `senders[i]` and `receiver[i]` pertain to the `i`th sent request.
     let mut receivers = Vec::with_capacity(PING_COUNT as usize);
     let mut senders = Vec::with_capacity(PING_COUNT as usize);
     for _ in 0..PING_COUNT {
@@ -49,10 +54,10 @@ async fn main() {
         receivers.push(rx);
         senders.push(tx);
     }
-    senders.reverse();
 
     let mut handles = Vec::with_capacity(PING_COUNT as usize);
 
+    // Spawn a listener
     tokio::spawn(async move {
         let mut buf: [MaybeUninit<u8>; RESPONSE_BYTES] = [MaybeUninit::uninit(); RESPONSE_BYTES];
         loop {
@@ -60,12 +65,20 @@ async fn main() {
             let received_at = Instant::now();
             let seq = validate_icmp_response_packet(&buf, len).unwrap();
             match receivers[seq as usize].try_recv() {
-                Ok(tx) => tx.send(received_at).unwrap(),
-                Err(_) => (), // TODO: handle errors
+                Ok(tx) => {
+                    if let Err(_) = tx.send(received_at) {
+                        eprintln!("Receiver dropped ({})", seq);
+                    }
+                }
+                // It doesn't seem usefull to separate the cases of
+                // too early and duplicated responses.
+                Err(_) => eprintln!("Unexpected echo reply ({})", seq),
             };
         }
     });
 
+    // Send requests and spawn response awaiting tasks for each
+    senders.reverse(); // Get ready to element `pop`ping
     let mut interval = tokio::time::interval(Duration::from_millis(PING_INTERVAL_MS));
     for i in 0..PING_COUNT {
         let p = create_icmp_request_packet(&mut request_buf, i, IDENTIFIER);
@@ -80,7 +93,7 @@ async fn main() {
                 Ok(Ok(received_at)) => {
                     println!("{},{},{}", ADDRESS, i, (received_at - sent_at).as_micros())
                 }
-                Ok(Err(e)) => eprintln!("Receiver dropped ({}): {}", i, e),
+                Ok(Err(e)) => eprintln!("Sender dropped ({}): {}", i, e),
                 Err(_) => println!("Timeout ({})", i),
             }
         }));
