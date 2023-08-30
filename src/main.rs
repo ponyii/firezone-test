@@ -1,6 +1,6 @@
 use std::{mem::MaybeUninit, sync::Arc, time::Duration, time::Instant};
 
-use pnet::packet::{icmp::echo_request::MutableEchoRequestPacket, Packet};
+use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
 use socket2::Socket;
 use tokio::{
     sync::{oneshot, oneshot::Receiver, oneshot::Sender},
@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use utils::{
-    create_icmp_request_packet, read_socket, socket, validate_icmp_response_packet, RESPONSE_BYTES,
+    read_socket, send_echo_request, socket, validate_icmp_response_packet, RESPONSE_BYTES,
 };
 
 pub mod utils;
@@ -22,8 +22,6 @@ const PING_COUNT: u16 = 10;
 // than 1 ms as this interval must be much longer than tokio task spawning time.
 const PING_INTERVAL_MS: u64 = 1;
 
-// Identifier randomization would be necessary to use multiple ICMP servers at once.
-const IDENTIFIER: u16 = 100;
 const ECHO_TIMEOUT_SEC: u64 = 5;
 
 enum Message {
@@ -32,6 +30,7 @@ enum Message {
     UnexpectedEcho(u16),
 }
 
+#[cfg(not(test))]
 impl Message {
     fn publish(self) {
         match self {
@@ -65,9 +64,7 @@ async fn send_requsts(
 
     let mut interval = tokio::time::interval(Duration::from_millis(PING_INTERVAL_MS));
     for i in 0..num {
-        let p = create_icmp_request_packet(&mut request_buf, i, IDENTIFIER);
-        socket.send(p.packet()).unwrap();
-
+        send_echo_request(&socket, &mut request_buf, i);
         let sent_at = Instant::now();
         let (tx, rx) = oneshot::channel::<Time>();
         senders.pop().unwrap().send(tx).unwrap();
@@ -82,7 +79,6 @@ async fn send_requsts(
                 Err(_) => Message::Timeout(i).publish(),
             }
         }));
-
         interval.tick().await;
     }
     handles
@@ -121,5 +117,54 @@ async fn main() {
     let handles = send_requsts(PING_COUNT, socket_for_sender, senders).await;
     for handle in handles {
         handle.await.expect("Task paniced");
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::*;
+
+    use std::mem::discriminant;
+
+    static mut OUT: Vec<Message> = vec![];
+
+    // Our test design makes concurrent `publish`ing impossible,
+    // so I don't really feel like using locks here
+    impl Message {
+        pub fn publish(self) {
+            unsafe { OUT.push(self) };
+        }
+    }
+
+    async fn run_tasks(senders: Vec<Sender<Sender<Time>>>) {
+        let fake_socket = Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM, // avoid permission checks on Linux
+            Some(socket2::Protocol::ICMPV4),
+        )
+        .unwrap();
+        let handles = send_requsts(PING_COUNT, Arc::new(fake_socket), senders).await;
+        for handle in handles {
+            handle.await.expect("Task paniced");
+        }
+    }
+
+    // TODO: test-only parameters
+
+    #[tokio::test]
+    async fn test_no_reply() {
+        let (senders, receivers) = create_oneshots(PING_COUNT as usize);
+        run_tasks(senders).await;
+        let expected_msg = discriminant(&Message::Timeout(0));
+        unsafe {
+            assert_eq!(
+                OUT.len(),
+                PING_COUNT as usize,
+                "There're irresponsive tasks"
+            );
+            for m in &OUT {
+                assert_eq!(discriminant(m), expected_msg, "Unexpected message");
+            }
+        }
     }
 }

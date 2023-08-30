@@ -10,6 +10,8 @@ use pnet::packet::{
 };
 use socket2::{SockAddr, Socket};
 
+// Identifier randomization would be necessary to use multiple ICMP servers at once.
+const IDENTIFIER: u16 = 100;
 pub const RESPONSE_BYTES: usize =
     EchoReplyPacket::minimum_packet_size() + Ipv4Packet::minimum_packet_size();
 
@@ -27,6 +29,24 @@ pub fn socket(address: &str) -> Socket {
     socket.connect(&to_sock_addr(address)).unwrap();
     socket.set_nonblocking(true).unwrap();
     socket
+}
+
+#[cfg(not(test))]
+pub fn send_echo_request(
+    socket: &Arc<Socket>,
+    buf: &mut [u8; MutableEchoRequestPacket::minimum_packet_size()],
+    seq: u16,
+) {
+    let p = create_icmp_request_packet(buf, seq, IDENTIFIER);
+    socket.send(p.packet()).unwrap();
+}
+
+#[cfg(test)]
+pub fn send_echo_request(
+    _: &Arc<Socket>,
+    _: &mut [u8; MutableEchoRequestPacket::minimum_packet_size()],
+    _: u16,
+) {
 }
 
 pub fn create_icmp_request_packet(
