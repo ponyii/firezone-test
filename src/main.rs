@@ -199,26 +199,55 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_no_reply() {
-        let cfg = Cfg {
+    fn test_config() -> Cfg {
+        Cfg {
             address: "".to_owned(),
             ping_count: 50,
             ping_interval_ms: 1,
             echo_timeout_sec: 1,
-        };
-        let (senders, receivers) = create_oneshots(cfg.ping_count as usize);
+        }
+    }
+
+    unsafe fn check(cfg: &Cfg, expected_msg: std::mem::Discriminant<Message>) {
+        assert_eq!(
+            OUT.len(),
+            cfg.ping_count as usize,
+            "There're irresponsive tasks"
+        );
+        for m in &OUT {
+            assert_eq!(discriminant(m), expected_msg, "Unexpected message");
+        }
+        OUT.clear();
+    }
+
+    #[tokio::test]
+    async fn test_no_reply() {
+        let cfg = test_config();
+        let (senders, _receivers) = create_oneshots(cfg.ping_count as usize);
         run_tasks(&cfg, senders).await;
         let expected_msg = discriminant(&Message::Timeout(0));
         unsafe {
-            assert_eq!(
-                OUT.len(),
-                cfg.ping_count as usize,
-                "There're irresponsive tasks"
-            );
-            for m in &OUT {
-                assert_eq!(discriminant(m), expected_msg, "Unexpected message");
+            check(&cfg, expected_msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quick_replies() {
+        let cfg = test_config();
+        let (senders, receivers) = create_oneshots(cfg.ping_count as usize);
+        let cfg_copy = cfg.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(cfg_copy.ping_interval_ms));
+            for mut rx in receivers {
+                interval.tick().await;
+                rx.try_recv().unwrap().send(Instant::now()).unwrap();
             }
+        });
+        run_tasks(&cfg, senders).await;
+        let expected_msg = discriminant(&Message::Ok("".to_string(), 0, Duration::default()));
+        unsafe {
+            check(&cfg, expected_msg);
         }
     }
 }
